@@ -15,6 +15,7 @@
 #include <sycl/ext/oneapi/experimental/enqueue_types.hpp>
 #include <sycl/ext/oneapi/experimental/free_function_traits.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <sycl/ext/oneapi/experimental/raw_kernel_arg.hpp>
 #include <sycl/ext/oneapi/properties.hpp>
 #include <sycl/handler.hpp>
 #include <sycl/nd_range.hpp>
@@ -97,6 +98,33 @@ template <typename LCRangeT, typename LCPropertiesT> struct LaunchConfigAccess {
     return MLaunchConfig.getProperties();
   }
 };
+
+// An argument that can be bound as plain bytes, i.e. one that carries no
+// requirement for the scheduler to track. Accessors, local accessors, streams
+// and work group memory are deliberately excluded and keep using the command
+// group path; `HasSpecialCaptures` in the runtime draws the same line.
+template <typename T>
+inline constexpr bool is_plain_kernel_arg_v =
+    std::is_arithmetic_v<std::decay_t<T>> || std::is_enum_v<std::decay_t<T>> ||
+    std::is_pointer_v<std::decay_t<T>> ||
+    std::is_same_v<std::decay_t<T>, raw_kernel_arg>;
+
+// A pointer has to keep its kind. The runtime binds a pointer argument as
+// UR_EXP_KERNEL_ARG_TYPE_POINTER, which the OpenCL adapter passes to
+// clSetKernelArgMemPointerINTEL rather than to clSetKernelArg, so plain bytes
+// are not a substitute.
+template <typename T>
+sycl::detail::KernelArgView makeKernelArgView(const T &Arg) {
+  using sycl::detail::kernel_param_kind_t;
+  if constexpr (std::is_same_v<std::decay_t<T>, raw_kernel_arg>)
+    return {RawKernelArgAccess::getData(Arg), RawKernelArgAccess::getSize(Arg),
+            kernel_param_kind_t::kind_std_layout};
+  else
+    return {&Arg, sizeof(T),
+            std::is_pointer_v<std::decay_t<T>>
+                ? kernel_param_kind_t::kind_pointer
+                : kernel_param_kind_t::kind_std_layout};
+}
 
 template <typename CommandGroupFunc, typename PropertiesT>
 void submit_impl(const queue &Q, PropertiesT Props, CommandGroupFunc &&CGF,
@@ -408,9 +436,64 @@ void nd_launch(handler &CGH, nd_range<Dimensions> Range,
 template <int Dimensions, typename... ArgsT>
 void nd_launch(queue Q, nd_range<Dimensions> Range, const kernel &KernelObj,
                ArgsT &&...Args) {
-  submit(std::move(Q), [&](handler &CGH) {
-    nd_launch(CGH, Range, KernelObj, std::forward<ArgsT>(Args)...);
-  });
+  // A container of raw_kernel_arg converts to the span the sibling overload
+  // takes, but a pack is an exact match and wins overload resolution, which
+  // would bind the container object itself as one argument. Diagnose it here,
+  // so that no other branch is instantiated for such a call.
+  constexpr bool ArgListPassedAsContainer =
+      sizeof...(ArgsT) == 1 &&
+      (std::is_convertible_v<ArgsT, span<const raw_kernel_arg>> && ...);
+  if constexpr (ArgListPassedAsContainer) {
+    static_assert(!ArgListPassedAsContainer,
+                  "The kernel argument list must be passed as "
+                  "sycl::span<const raw_kernel_arg>, e.g. {Args.data(), "
+                  "Args.size()}");
+  } else if constexpr ((detail::is_plain_kernel_arg_v<ArgsT> && ...)) {
+    // Bind the arguments straight from this call, so that neither a handler nor
+    // a command group object has to be created. The array is one element longer
+    // than the pack so that a zero-argument kernel stays well formed.
+    const sycl::detail::KernelArgView ArgViews[sizeof...(ArgsT) + 1] = {
+        detail::makeKernelArgView(Args)...};
+    // An overload that ends in a parameter pack cannot take a trailing
+    // code_location parameter, so the location is the one this header sees,
+    // as it was when this overload went through submit(). Seed the TLS slot
+    // rather than leaving it default-constructed, which the instrumentation
+    // reads as a null file and function name.
+    sycl::detail::tls_code_loc_t TlsCodeLocCapture{
+        sycl::detail::code_location::current()};
+    sycl::submit_kernel_obj_direct_without_event_impl(
+        Q, sycl::detail::nd_range_view(Range), KernelObj,
+        {ArgViews, sizeof...(ArgsT)}, TlsCodeLocCapture.query(),
+        TlsCodeLocCapture.isToplevel());
+  } else {
+    submit(std::move(Q), [&](handler &CGH) {
+      nd_launch(CGH, Range, KernelObj, std::forward<ArgsT>(Args)...);
+    });
+  }
+}
+
+template <int Dimensions>
+void nd_launch(handler &CGH, nd_range<Dimensions> Range,
+               const kernel &KernelObj, span<const raw_kernel_arg> Args) {
+  // set_arg only takes an rvalue raw_kernel_arg; an lvalue would select the
+  // generic overload and bind the object itself as the argument.
+  for (size_t I = 0; I < Args.size(); ++I)
+    CGH.set_arg(static_cast<int>(I), raw_kernel_arg{Args[I]});
+  CGH.parallel_for(Range, KernelObj);
+}
+
+// Takes the kernel arguments as a contiguous sequence instead of a parameter
+// pack, for a caller that only learns its argument list at run time and would
+// otherwise need one instantiation of the pack overload per argument count.
+template <int Dimensions>
+void nd_launch(queue Q, nd_range<Dimensions> Range, const kernel &KernelObj,
+               span<const raw_kernel_arg> Args,
+               const sycl::detail::code_location &CodeLoc =
+                   sycl::detail::code_location::current()) {
+  sycl::detail::tls_code_loc_t TlsCodeLocCapture(CodeLoc);
+  sycl::submit_kernel_obj_direct_without_event_impl(
+      Q, sycl::detail::nd_range_view(Range), KernelObj, Args,
+      TlsCodeLocCapture.query(), TlsCodeLocCapture.isToplevel());
 }
 
 template <int Dimensions, typename Properties, typename... ArgsT>
