@@ -360,13 +360,15 @@ Sema::ActOnParamDefaultArgument(Decl *param, SourceLocation EqualLoc,
     return ActOnParamDefaultArgumentError(param, EqualLoc, DefaultArg);
   }
 
-  // Check for unexpanded parameter packs.
-  if (DiagnoseUnexpandedParameterPack(DefaultArg, UPPC_DefaultArgument))
-    return ActOnParamDefaultArgumentError(param, EqualLoc, DefaultArg);
-
   // C++11 [dcl.fct.default]p3
   //   A default argument expression [...] shall not be specified for a
   //   parameter pack.
+  //
+  // Check this before looking for unexpanded parameter packs in DefaultArg:
+  // if DefaultArg references a pack from an enclosing lambda/block, that
+  // check would (incorrectly) mark the lambda as containing an unexpanded
+  // pack that never actually appears in the final AST once we discard
+  // DefaultArg below.
   if (Param->isParameterPack()) {
     Diag(EqualLoc, diag::err_param_default_argument_on_parameter_pack)
         << DefaultArg->getSourceRange();
@@ -374,6 +376,10 @@ Sema::ActOnParamDefaultArgument(Decl *param, SourceLocation EqualLoc,
     Param->setDefaultArg(nullptr);
     return;
   }
+
+  // Check for unexpanded parameter packs.
+  if (DiagnoseUnexpandedParameterPack(DefaultArg, UPPC_DefaultArgument))
+    return ActOnParamDefaultArgumentError(param, EqualLoc, DefaultArg);
 
   ExprResult Result = ConvertParamDefaultArgument(Param, DefaultArg, EqualLoc);
   if (Result.isInvalid())
@@ -1945,7 +1951,7 @@ static bool CheckConstexprMissingReturn(Sema &SemaRef, const FunctionDecl *Dcl);
 bool Sema::CheckConstexprFunctionDefinition(const FunctionDecl *NewFD,
                                             CheckConstexprKind Kind) {
   const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(NewFD);
-  if (MD && MD->isInstance()) {
+  if (!getLangOpts().CPlusPlus26 && MD && MD->isInstance()) {
     // C++11 [dcl.constexpr]p4:
     //  The definition of a constexpr constructor shall satisfy the following
     //  constraints:
@@ -2477,8 +2483,6 @@ static bool CheckConstexprFunctionBody(Sema &SemaRef, const FunctionDecl *Dcl,
       }
     } else if (!Constructor->isDependentContext() &&
                !Constructor->isDelegatingConstructor()) {
-      assert(RD->getNumVBases() == 0 && "constexpr ctor with virtual bases");
-
       // Skip detailed checking if we have enough initializers, and we would
       // allow at most one initializer per member.
       bool AnyAnonStructUnionMembers = false;
@@ -7504,6 +7508,23 @@ void Sema::CheckCompletedCXXClass(Scope *S, CXXRecordDecl *Record) {
     SYCL().CheckSYCLScopeAttr(Record);
   }
 
+  // A kernel which merely constructs an object of a polymorphic class is
+  // detected by SYCLVirtualFunctionsAnalysisPass through the vtable it
+  // references, which requires the vtable definition (and not just a
+  // declaration) to be present in the module. The vtable of a class with a key
+  // function is normally only emitted in the translation unit defining that key
+  // function, which may be a different one from the one containing the kernel,
+  // so force its emission here for every translation unit that completes such a
+  // class. Note that this may end up emitting the vtable global in translation
+  // units where it is not needed since this semantic action is triggered by the
+  // mere inclusion of the class in a translation unit rather than a use of one
+  // of its virtual functions. In such cases however, the vtable will typically
+  // be discarded by optimizers if not referenced within the unit.
+  if (getLangOpts().SYCLIsDevice &&
+      SemaSYCL::hasSYCLIndirectlyCallableVirtualMethod(Record))
+    MarkVTableUsed(Record->getInnerLocStart(), Record,
+                   /*DefinitionRequired=*/true);
+
   llvm::SmallDenseMap<OverloadedOperatorKind,
                       llvm::SmallVector<const FunctionDecl *, 2>, 4>
       TypeAwareDecls{{OO_New, {}},
@@ -7754,12 +7775,12 @@ static bool defaultedSpecialMemberIsConstexpr(
                : true;
 
   //   -- the class shall not have any virtual base classes;
-  if (Ctor && ClassDecl->getNumVBases())
+  if (!S.getLangOpts().CPlusPlus26 && Ctor && ClassDecl->getNumVBases())
     return false;
 
   // C++1y [class.copy]p26:
   //   -- [the class] is a literal type, and
-  if (!Ctor && !ClassDecl->isLiteral() && !S.getLangOpts().CPlusPlus23)
+  if (!S.getLangOpts().CPlusPlus23 && !Ctor && !ClassDecl->isLiteral())
     return false;
 
   //   -- every constructor involved in initializing [...] base class
@@ -8119,7 +8140,6 @@ bool Sema::CheckExplicitlyDefaultedSpecialMember(CXXMethodDecl *MD,
         HadError = true;
         // FIXME: Explain why the special member can't be constexpr.
   }
-
   if (First) {
     // C++2a [dcl.fct.def.default]p3:
     //   If a function is explicitly defaulted on its first declaration, it is
@@ -15535,10 +15555,30 @@ void Sema::DefineImplicitCopyAssignment(SourceLocation CurrentLocation,
     Statements.push_back(Copy.getAs<Expr>());
   }
 
+  // A defaulted copy assignment operator for a union copies the object
+  // representation as if by a memcpy, the same way the defaulted union copy
+  // constructor does.  The memberwise loop below skips union members.
+  if (ClassDecl->isUnion()) {
+    ExprBuilder &To = ExplicitObject
+                          ? static_cast<ExprBuilder &>(*ExplicitObject)
+                          : static_cast<ExprBuilder &>(*DerefThis);
+    // Copying the object representation is correct even for a union that is
+    // not trivially copyable, so -Wnontrivial-memcall is a false positive
+    // here.  Ignoring warnings rather than casting the arguments to void*
+    // keeps them typed, which preserves their address space.
+    IgnoreAllWarningDiagRAII IgnoreWarnings(Diags);
+    StmtResult Copy = buildMemcpyForAssignmentOp(
+        *this, Loc, Context.getCanonicalTagType(ClassDecl), To, OtherRef);
+    if (Copy.isInvalid()) {
+      CopyAssignOperator->setInvalidDecl();
+      return;
+    }
+    Statements.push_back(Copy.getAs<Stmt>());
+  }
+
   // Assign non-static members.
   for (auto *Field : ClassDecl->fields()) {
-    // FIXME: We should form some kind of AST representation for the implied
-    // memcpy in a union copy operation.
+    // Union members are copied by the whole-object memcpy emitted above.
     if (Field->isUnnamedBitField() || Field->getParent()->isUnion())
       continue;
 
@@ -15925,10 +15965,30 @@ void Sema::DefineImplicitMoveAssignment(SourceLocation CurrentLocation,
     Statements.push_back(Move.getAs<Expr>());
   }
 
+  // A defaulted move assignment operator for a union copies the object
+  // representation as if by a memcpy, the same way the defaulted union copy
+  // constructor does.  The memberwise loop below skips union members.
+  if (ClassDecl->isUnion()) {
+    ExprBuilder &To = ExplicitObject
+                          ? static_cast<ExprBuilder &>(*ExplicitObject)
+                          : static_cast<ExprBuilder &>(*DerefThis);
+    // Copying the object representation is correct even for a union that is
+    // not trivially copyable, so -Wnontrivial-memcall is a false positive
+    // here.  Ignoring warnings rather than casting the arguments to void*
+    // keeps them typed, which preserves their address space.
+    IgnoreAllWarningDiagRAII IgnoreWarnings(Diags);
+    StmtResult Copy = buildMemcpyForAssignmentOp(
+        *this, Loc, Context.getCanonicalTagType(ClassDecl), To, OtherRef);
+    if (Copy.isInvalid()) {
+      MoveAssignOperator->setInvalidDecl();
+      return;
+    }
+    Statements.push_back(Copy.getAs<Stmt>());
+  }
+
   // Assign non-static members.
   for (auto *Field : ClassDecl->fields()) {
-    // FIXME: We should form some kind of AST representation for the implied
-    // memcpy in a union copy operation.
+    // Union members are copied by the whole-object memcpy emitted above.
     if (Field->isUnnamedBitField() || Field->getParent()->isUnion())
       continue;
 
@@ -19324,7 +19384,17 @@ bool Sema::DefineUsedVTables() {
     const CXXMethodDecl *KeyFunction = Context.getCurrentKeyFunction(Class);
     // V-tables for non-template classes with an owning module are always
     // uniquely emitted in that module.
-    if (Class->isInCurrentModuleUnit()) {
+    // For SYCL device compilation vtables of classes with 'indirectly_callable'
+    // virtual functions are emitted in every translation unit which references
+    // them, regardless of where the key function is defined: middle-end
+    // analyses of virtual functions (see SYCLVirtualFunctionsAnalysisPass) need
+    // to see the vtable initializer in order to figure out which virtual
+    // functions a kernel may reference. Such vtables are given linkonce_odr
+    // linkage by CodeGenModule::getVTableLinkage so that emitting them more
+    // than once is not a problem.
+    if (Class->isInCurrentModuleUnit() ||
+        (getLangOpts().SYCLIsDevice &&
+         SemaSYCL::hasSYCLIndirectlyCallableVirtualMethod(Class))) {
       DefineVTable = true;
     } else if (KeyFunction && !KeyFunction->hasBody()) {
       // If this class has a key function, but that key function is

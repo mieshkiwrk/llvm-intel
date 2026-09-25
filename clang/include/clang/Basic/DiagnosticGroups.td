@@ -351,6 +351,7 @@ def ExtraTokens : DiagGroup<"extra-tokens">;
 def CXX98CompatExtraSemi : DiagGroup<"c++98-compat-extra-semi">;
 def CXX11ExtraSemi : DiagGroup<"c++11-extra-semi">;
 def EmptyInitStatement : DiagGroup<"empty-init-stmt">;
+def ExpansionStmtBody : DiagGroup<"expansion-stmt-missing-braces">;
 def ExportUnnamed : DiagGroup<"export-unnamed">;
 def ExtraSemiStmt : DiagGroup<"extra-semi-stmt", [EmptyInitStatement]>;
 def ExtraSemi : DiagGroup<"extra-semi", [CXX98CompatExtraSemi,
@@ -610,6 +611,12 @@ Warning to detect dangling field references.
 This may contain false-positives, e.g. when the borrowed storage is potentially moved and is not destroyed at function exit.
   }];
 }
+def LifetimeSafetyDanglingFieldLambdaCapture : DiagGroup<"lifetime-safety-dangling-field-lambda-capture"> {
+  code Documentation = [{
+Warning to detect dangling field references.
+This may contain false-positives, e.g. when the field is captured by a lambda that resets the field before function exit.
+  }];
+}
 
 def LifetimeSafetyDanglingGlobal : DiagGroup<"lifetime-safety-dangling-global"> {
   code Documentation = [{
@@ -669,6 +676,7 @@ def LifetimeSafetyStrict : DiagGroup<"lifetime-safety-strict",
                                     LifetimeSafetyUseAfterScopeMoved,
                                     LifetimeSafetyReturnStackAddrMoved,
                                     LifetimeSafetyDanglingFieldMoved,
+                                    LifetimeSafetyDanglingFieldLambdaCapture,
                                     LifetimeSafetyDanglingGlobalMoved,
                                     LifetimeSafetyInvalidation]>;
 
@@ -1780,6 +1788,7 @@ def SyclFPGAMismatch : DiagGroup<"sycl-fpga-mismatch">;
 def SyclAspectMismatch : DiagGroup<"sycl-aspect-mismatch">;
 def SyclNativeCPUTargets: DiagGroup<"sycl-native-cpu-targets">;
 def SyclPrivateAllocaPositiveSize : DiagGroup<"sycl-private-alloca-positive-size">;
+def SyclUndefinedFuncInImage : DiagGroup<"sycl-undefined-func-in-image">;
 
 // Common warnings for SYCL and OpenMP offloading
 def OffloadTarget : DiagGroup<"offload-target">;
@@ -2034,3 +2043,5 @@ def ExperimentalOption : DiagGroup<"experimental-option">;
 
 // Warnings about unguarded usages of AMDGPU target specific constructs
 def UnguardedBuiltinUsageAMDGPU : DiagGroup<"amdgpu-unguarded-builtin-usage">;
+
+def AvailableVisibleAMDGPU : DiagGroup<"amdgpu-av">;

@@ -603,8 +603,11 @@ private:
   void setArgHelper(int ArgIndex,
                     sycl::ext::oneapi::experimental::raw_kernel_arg &&Arg) {
     auto StoredArg = storeRawArg(Arg);
-    addArg(detail::kernel_param_kind_t::kind_std_layout, StoredArg,
-           Arg.MArgSize, ArgIndex);
+    // A pointer argument has to be bound as one: a backend may reach for it
+    // through a different entry point than the one that takes plain bytes.
+    addArg(Arg.MIsPointer ? detail::kernel_param_kind_t::kind_pointer
+                          : detail::kernel_param_kind_t::kind_std_layout,
+           StoredArg, Arg.MArgSize, ArgIndex);
   }
 
   /// Registers a dynamic parameter with the handler for later association with
@@ -1082,6 +1085,8 @@ private:
   kernel_bundle<bundle_state::input> getKernelBundle() const;
 
 public:
+  handler() = delete;
+
   handler(const handler &) = delete;
   handler(handler &&) = delete;
   handler &operator=(const handler &) = delete;
@@ -1166,7 +1171,7 @@ public:
             std::is_pointer_v<remove_cv_ref_t<T>>) // USM
         || is_same_type<OpenCLMemT, T>::value      // Interop
         || is_same_type<stream, T>::value          // Stream
-        || sycl::is_device_copyable_v<remove_cv_ref_t<T>>;
+        || detail::check_if_device_copyable_v<remove_cv_ref_t<T>>;
   };
 
   /// Sets argument for OpenCL interoperability kernels.
@@ -2014,7 +2019,7 @@ public:
   template <typename T> void fill(void *Ptr, const T &Pattern, size_t Count) {
     throwIfActionIsCreated();
     setUserFacingNodeType(ext::oneapi::experimental::node_type::memfill);
-    static_assert(is_device_copyable<T>::value,
+    static_assert(detail::check_if_device_copyable_v<T>,
                   "Pattern must be device copyable");
     if (getDeviceBackend() == backend::ext_oneapi_level_zero) {
       parallel_for<__usmfill<T>>(range<1>(Count), [=](id<1> Index) {
